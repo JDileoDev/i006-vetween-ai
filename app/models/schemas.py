@@ -15,16 +15,27 @@ class Paciente(BaseModel):
     especie: str
     edad: int
     sexo: str
+    raza: str
+    color: str
+    senia: str
+    peso: int | float
+    esterilizado: bool
+    tiene_microchip: bool
+    num_microchip: Optional[str] = None
 
 class Visitas(BaseModel):
     fecha: str
     motivo_consulta: str
-    diagnostico: str
-    tratamiento: str
+    diagnostico:Optional[str] = None
+    tratamiento: Optional[str] = None
+    observaciones: Optional[str] = None
+    historial_previo: Optional[str] = None
 
 class Vacunas(BaseModel):
     tipo: str
+    nombre_cientifico: str
     fecha_aplicacion: str
+    observacion: Optional[str] = None
 
 class DatosClinicos(BaseModel):
     paciente: Paciente
@@ -52,8 +63,8 @@ class VacunaResponse(BaseModel):
 class VisitaResponse(BaseModel):
     fecha: str
     motivo: str
-    diagnostico: str
-    tratamiento: str
+    diagnostico: Optional[str] = None
+    tratamiento: Optional[str] = None
 
 class ResumenEstructurado(BaseModel):
     estado_general: str
