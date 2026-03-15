@@ -10,6 +10,7 @@ from app.test.test_ia import ping_ia
 import time 
 from app.services.ai_service import AIService
 from app.api.dependencies import get_ai_service
+import app.test.test_ia as test_ia
 
 
 logger = get_logger(__name__)

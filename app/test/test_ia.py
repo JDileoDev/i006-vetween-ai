@@ -24,3 +24,29 @@ async def ping_ia():
 
 if __name__ == "__main__":
     asyncio.run(ping_ia())
+import httpx
+import asyncio
+from app.config.settings import settings
+import time
+
+async def ping_ia():
+    url = settings.nvidia_api_url
+    headers = {
+        "Authorization": f"Bearer {settings.nvidia_api_key}", # Reemplaza con tu key
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": "meta/llama-3.3-70b-instruct",
+        "messages": [{"role": "user", "content": "Responder solo: OK"}],
+        "max_tokens": 5
+    }
+
+    print(f"🚀 Enviando ping a llama 3...")
+    
+    async with httpx.AsyncClient() as client:
+        await client.post(url, headers=headers, json=payload, timeout=10.0)
+
+
+if __name__ == "__main__":
+    asyncio.run(ping_ia())

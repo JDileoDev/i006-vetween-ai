@@ -1,9 +1,11 @@
 """Pydantic models for request/response schemas."""
 
-from pydantic import BaseModel, Field ,ConfigDict
+from pydantic import BaseModel, Field ,ConfigDict ,model_validator
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+import logging
 
+logger = logging.getLogger("uvicorn.error")
 
 class ChatMessage(BaseModel):
     """Chat message model."""
@@ -20,7 +22,7 @@ class Paciente(BaseModel):
     sexo: str
     raza: str
     color: str
-    senia: str
+    senia: Optional[str] = None
     peso: int | float
     # Permitimos NoNe para que la API no falle si el dato no viene del Frontend.
     # La IA usará este 'null' para sugerir completar la ficha.
@@ -45,14 +47,43 @@ class Vacunas(BaseModel):
     observacion: Optional[str] = None
 
 class DatosClinicos(BaseModel):
-    """Contenedor de toa la historia clinica para enviar a la IA."""
+    """Contenedor de toda la historia clinica para enviar a la IA."""
     paciente: Paciente
     visitas: List[Visitas]
     vacunas: List[Vacunas]
 
+    @model_validator(mode='after')
+    def verificar_coherencia_especie(self)-> 'DatosClinicos':
+
+        especie_original = self.paciente.especie.lower()[:4]
+
+        REGLAS_EXCLUSION = {
+            "feli": ["cani","perr","porc", "equi","bovi"],
+            "cani": ["feli","gato","gata", "porc","equi","bovi"],
+            "perr": ["feli","gato","gata","porc","equi","bovi"],
+            "gato": ["perr","cani","porc","equi","bovi"],
+            "gata": ["perr","cani","porc","equi","bovi"]
+        }
+
+        palabras_prohibidas = []
+        for k , prohibidas in REGLAS_EXCLUSION.items():
+            if k in especie_original:
+                palabras_prohibidas = prohibidas
+                break
+        for vacuna in self.vacunas:
+            texto_vacuna = (vacuna.tipo + " " + vacuna.nombre_cientifico).lower()
+
+            for prohibida in palabras_prohibidas:
+                if prohibida in texto_vacuna:
+                    logger.error(f"Inconsistencia detectada: El paciente es {self.paciente.especie}"
+                        f"pero la vacuna '{vacuna.tipo} parece ser para otra especie.")
+                    raise ValueError("AI_INPUT_INVALID")
+                
+        return self
+
 class ResumeniaRequest(BaseModel):
     """Modelo principal para solicitar un nuevo resumen a la IA."""
-    model: str = Field(default="google/gemini-2.0-flash-001", description="AI model to use")
+    model: str = Field(default="meta/llama-3.3-70b-instruct", description="AI model to use")
     
     # Campos obligatorios vinculados al a base de datos.
     id_paciente: int = Field(... , description="ID del paciente")
@@ -60,9 +91,11 @@ class ResumeniaRequest(BaseModel):
 
     # Parámetros de control de la IA.
     max_tokens: Optional[int] = Field(default=1000, ge=1, le=4096, description="Maximum tokens to generate")
-    temperature: Optional[float] = Field(default=0.2, ge=0.0, le=2.0, description="Sampling temperature")
+    temperature: Optional[float] = Field(default=0.0, ge=0.0, le=2.0, description="Sampling temperature")
+    frequency_penalty: Optional[float] = Field(default=1.5)
+    presence_penalty : Optional[float] = Field(default=0.5)
     stream: Optional[bool] = Field(default=False, description="Enable streaming response")
-
+    fecha_actual: Optional[datetime] = Field(default_factory=datetime.now)
 # --- Modelos de Respuesta Estructurada (JSON) ---
 
 class VacunaResponse(BaseModel):
@@ -107,7 +140,7 @@ class ModeloRequest(BaseModel):
     id_paciente : int = Field(..., description="ID del paciente")
     datos_clinicos : DatosClinicos = Field(..., description="Historia clinica del paciente")
     fecha_request: datetime = Field(..., description="Fecha del request" )
-
+    hash: str = Field (... , description= "Hash del request")
 class RequestsPaciente(BaseModel):
     """Lista de peticiones realizadas por un paciente."""
     data: List[ModeloRequest] 
@@ -152,3 +185,6 @@ class RootResponse(BaseModel):
     version: str = Field(..., description="Version 1.0")
     docs: str = Field(..., description="Documentación URL")
     health: str = Field(..., description="Health check URL")
+
+
+

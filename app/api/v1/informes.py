@@ -14,8 +14,11 @@ from app.models.schemas import (
     ModelInfo
 )
 from app.services.ai_service import AIService
+
+import app.repositories.ia_repository as db_ia
 from app.api.dependencies import get_ai_service
 from app.core.logging import get_logger
+import time
 
 # Configuración de Logger y Router
 logger = get_logger(__name__)
@@ -54,23 +57,50 @@ async def resumen_ia(request: ResumeniaRequest, ai_service: AIService = Depends(
     3. Persiste el resumen generado por la IA en la base de datos (Output).
     4. Devuelve el análisis procesado al cliente.
     """
+
+    #----- INICIO CRONOMETRO --------
+    inicio_c = time.perf_counter()
+    resultado_metrica = "FALLO_DESCONOCIDO"
+    error_msg = None
+
     try:
         logger.info(f"Procesando resumen con modelo: {request.model}")
         
         # Guardar registro de la solicitud (input)
-        guardar_request = await ai_service.save_request(
+        guardar_request = await db_ia.save_request(
             request.id_paciente,
             request.datos_clinicos
         )
-        id_request = guardar_request["id_request_ia"]
-
+        if not guardar_request:
+            # Si es None, enviamos al cliente el resumen persistido para ese request exacto
+            resultado_metrica = "CACHE_HIT"
+            id_paciente = int(request.id_paciente)
+            data = db_ia.total_resumenes_ia_paciente(id_paciente)
+            return data[0]
+        else:
+            resultado_metrica = "CACHE_MISS"
+            id_request = guardar_request["id_request_ia"]
+            fecha_actual = guardar_request["fecha_request"]
+        
         # Generación y persistencia automática del resumen (Output)
         # Nota: 'generar_resumenia' internamente guarda el resultado en DB
-        data = await ai_service.generar_resumenia(request,id_request)
-        return data
+            data = await ai_service.generar_resumenia(
+                request,
+                id_request,
+                fecha_actual
+                )
+            return data
     
     except ValueError as e:
+        resultado_metrica = "FALLO"
         error_msg = str(e)
+
+        try:
+            db_ia.eliminar_registro(id_request)
+            logger.info(f"Registro {id_request} eliminado por fallo en IA.")
+        except Exception as delete_error:
+            logger.error(f"No se pudo limpiar el registro fallido: {str(delete_error)}")
+        
         # Mapeo de errores específicos del servicio de IA
         if error_msg == "AI_TIMEOUT":
             raise HTTPException(
@@ -107,13 +137,23 @@ async def resumen_ia(request: ResumeniaRequest, ai_service: AIService = Depends(
                 detail="Ocurrió un error inesperado al procesar la IA."
             )
 
+    finally:
+        fin_c = time.perf_counter()
+        latencia = fin_c - inicio_c
+
+        db_ia.registrar_metricas_db(
+            resultado= resultado_metrica,
+            segundos= latencia,
+            error= error_msg
+        )
+
 @router.get("/resumenia", response_model=List[ModeloResumen])
-def listar_todos_los_resumenes(ai_service: AIService = Depends(get_ai_service)):
+def listar_todos_los_resumenes():
     """
     Recupera el historial completo de resúmenes generados por la IA en el sistema.
     """
     try:
-        return ai_service.total_resumenes_ia()
+        return db_ia.total_resumenes_ia()
     except ValueError:
         raise HTTPException(
             status_code=500,
@@ -123,14 +163,14 @@ def listar_todos_los_resumenes(ai_service: AIService = Depends(get_ai_service)):
 @router.get("/resumenia/{id_paciente}", response_model=list[ModeloResumen])
 def resumenes_paciente(
     id_paciente : int , 
-    ai_service : AIService = Depends(get_ai_service)):
+    ):
     
     """
     Obtiene todos los informes/resúmenes generados para un paciente específico.
     """
     try:
         # 1. Llamada al servicio: consultamos la persistencia (DB) filtando por ID de paciente
-        data = ai_service.total_resumenes_ia_paciente(id_paciente)
+        data = db_ia.total_resumenes_ia_paciente(id_paciente)
         
         # 2. Validación de existencia: si la lista vuelve vacia, informamos al cliente
         # Es importante distinguir ente un error de servidor y un dato no encontrado (404)
@@ -155,14 +195,14 @@ def resumenes_paciente(
 #---------------------------------------------------------------------------------------
 
 @router.get("/request", response_model=List[ModeloRequest])
-def listar_requests(ai_service : AIService = Depends(get_ai_service)):
+def listar_requests():
     """
     Lista todos los logs de peticiones enviadas (Input original del usuario).
     """
     try:
         # 1. Recuperamos la totalidad de los inputs enviados a la IA.
         # Útil para auditoria y ver qué datos están enviando los usuarios.
-        return ai_service.total_requests()
+        return db_ia.total_requests()
     
     except Exception as e:
         # 2. logueamos el error técnico para el desarrollador.
@@ -176,7 +216,6 @@ def listar_requests(ai_service : AIService = Depends(get_ai_service)):
 @router.get("/request/{id_paciente}", response_model=list[ModeloRequest])
 def requests_paciente(
     id_paciente : int , 
-    ai_service : AIService = Depends(get_ai_service)
 ):
     
     """
@@ -184,7 +223,7 @@ def requests_paciente(
     """
     try:
         # 1. filtramos los inputs originales en la base de datos por el ID del paciente
-        data = ai_service.total_request_paciente(id_paciente)
+        data = db_ia.total_request_paciente(id_paciente)
         
         # 2. Control de flujo: Si el paciente existe pero nunca envió nada a la IA
         # devolvemos un 404 para indicar ausencia de datos

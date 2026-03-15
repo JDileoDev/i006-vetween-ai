@@ -5,61 +5,31 @@ prompts y la persistencia de datos en Supabase.
 """
 
 import httpx
-import uuid
 import json
+import hashlib
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List
 from app.core.database import supabase
 from app.config.settings import settings
 from app.models.schemas import ( 
-    DatosClinicos,
-    ResumenesPaciente, 
-    RequestsPaciente , 
+    DatosClinicos, 
     ResumeniaRequest, 
     ResumeniaResponse, 
-    ModelInfo
+    ModelInfo,
 )
 from app.core.logging import get_logger
 from app.core.security import mask_api_key
-
-import os
-
-def cargar_prompt(nombre_archivo="system_prompt.txt"):
-    """
-    Carga las instrucciones del sistema desde un archivo de texto.
-    Esto permite modificar el comportamiento de la IA sin tocar el código Python.
-    """
-
-    # 1. Definición de la ruta: Se busca en la carptea core/prompts.
-    # Usar archivos externos permite ajustar el "tono" de la IA sin redeployar código.
-    ruta = f"app/core/prompts/{nombre_archivo}"
-    
-    try:
-        # 2. Intento de lectura: Abrimos el archivo con encoding utf-8 para evitar
-        # problemas con tildes o caracteres especiales del español.
-        with open(ruta, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    
-    except FileNotFoundError:
-        # 3. Fallback de seguridad: Si por error se borra el archivo o la ruta está mal escrita
-        # devolvemos un prompt básico para qeu el servicio siga opetando y no devuelva error 500
-        logger.warning(f"Archivo de prompt no encotnrado en: {ruta}. Usando configuración por defecto.")
-        return "Sos un asistente veterinario. Tu tarea es resumir historiales clínicos en JSON."
-    
-    except Exception as e:
-        # 4- Gestión de errores inseperados: Errores de permisos o lectura de disco. 
-        print(f" Error inesperado al cargar el prompt: {e}")
-        return "Error interno al cargar instrucciones."
+from app.services.gestion_vacunas import evaluar_vacunas
+from app.core.prompt_manager import cargar_prompt
 
 logger = get_logger(__name__)
-
 
 class AIService:
     """
     Sercivio para imteractuar con la API de OpenROuter y gestionar 
     el ciclo de vida de los informes de IA.
     """
-    
+
     def __init__(self):
         """
         inicializa el cliente HTTP asíncronico con la configuracion de OpenRouter.
@@ -67,22 +37,22 @@ class AIService:
         """
         # Configruación del cliente con headers obligatorios de OpenRouter
         self.client = httpx.AsyncClient(
-            base_url=settings.openrouter_base_url,
+            base_url=settings.nvidia_api_url,
             headers={
-                "Authorization": f"Bearer {settings.openrouter_api_key}",
+                "Authorization": f"Bearer {settings.nvidia_api_key}",
                 "Content-Type": "application/json",
                 "HTTP-Referer": "https://github.com/your-username/template-python-fastapi",
                 "X-Title": settings.app_name,
             },
-            timeout=60.0 # Tiempo de espera extendido para procesamiento de LLMs
+            timeout=140.0 # Tiempo de espera extendido para procesamiento de LLMs
         )
         # Log de confirmación con enmascaramiento de credenciales por seguridad
-        logger.info(f"AI Service initialized with API key: {mask_api_key(settings.openrouter_api_key)}")  
-    
+        logger.info(f"AI Service initialized with API key: {mask_api_key(settings.nvidia_api_key)}")  
+
     async def list_models(self) -> List[ModelInfo]:
         """List available models from OpenRouter."""
         try:
-            logger.info("Fetching available models from OpenRouter")
+            logger.info("Fetching available models from NVIDIA NMI")
             response = await self.client.get("/models")
             response.raise_for_status()
             
@@ -103,14 +73,14 @@ class AIService:
             return models
             
         except httpx.HTTPStatusError as e:
-            error_msg = f"OpenRouter API error: {e.response.status_code} - {e.response.text}"
+            error_msg = f"NVIDIA NMI API error: {e.response.status_code} - {e.response.text}"
             logger.error(error_msg)
             raise Exception(error_msg)
         except Exception as e:
             error_msg = f"Error fetching models: {str(e)}"
             logger.error(error_msg)
             raise Exception(error_msg)
-    
+
     async def health_check(self) -> bool:
         """Check if the AI service is healthy."""
         try:
@@ -120,17 +90,54 @@ class AIService:
         except Exception as e:
             logger.error(f"AI service health check failed: {str(e)}")
             return False
-    
-    async def generar_resumenia(self, request: ResumeniaRequest ,id_request_ia: int) -> ResumeniaResponse :
+
+    async def generar_resumenia(self, 
+                                request: ResumeniaRequest ,
+                                id_request_ia: int,
+                                fecha_actual: str
+                                ) -> ResumeniaResponse :
         """Cordina la generación del resumen médico con IA y su persistencia
         en la base de datos."""
+        
+        fecha_referencia = datetime.fromisoformat(fecha_actual).strftime("%Y-%m-%d")
+        
+        datos_modelo = request.datos_clinicos
+        
+        resultado_sanitario = evaluar_vacunas(
+            datos_modelo.vacunas,
+            fecha_referencia
+        )
+        
+        datos = datos_modelo.model_dump()
+        datos["evaluacion_sanitaria"] = resultado_sanitario
+        datos["fecha_actual"] = fecha_referencia
 
+        visitas = datos["visitas"]
+
+        visitas_ordenadas = sorted(
+        visitas,
+        key=lambda v: v["fecha"],
+        reverse=True
+        )
+
+        datos["visitas"] = visitas_ordenadas
+        
         # 1. Prompt Engineering: Cargamos instruccions externas y armamos el historial
         system_prompt = cargar_prompt()
         messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Generá un resumen estructuradocon estos datos: {request.datos_clinicos}"}
-        ]
+            {
+                "role": "system", 
+                "content": f"{system_prompt}<|eot|>"
+            },
+            {
+                "role": "user", 
+                "content": (
+                    "DATOS DEL PACIENTE:\n"
+                    f"```json\n{datos}\n```\n"
+                    "Transforma estos datos en un resumen narrativo fluido, profesional y humano.<|eot|>"
+                )
+            }
+        ]   
 
         # 2. Preparacion del Payload siguiendo el contrato de OpenRoute/Gemini
         payload = {
@@ -139,7 +146,10 @@ class AIService:
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
             "stream": request.stream,
+            "response_format": { "type": "json_object" }
         }
+
+        print(f"DEBUG 1 - Fecha recibida: {fecha_actual} (Tipo: {type(fecha_actual)})")
 
         try:
             # 3. LLamada a la API externa
@@ -164,7 +174,7 @@ class AIService:
             # 7. Lógica de limpieza: Si el input fue inválido, eliminamos el registro de auditoria
             if isinstance(ia_output, dict) and ia_output.get("error") == "INPUT_INVALIDO":
                     logger.warning(f"Inteto de resumen invalido para paciente {request.id_paciente}")
-                    self.eliminar_registro(id_request_ia)
+                    logger.error(f"AI_INPUT_INVALID: {str(request)}")
                     raise ValueError("AI_INPUT_INVALID")
             
             # 8. Extracción de campos obligatorios según el Schema
@@ -196,17 +206,20 @@ class AIService:
         # -------------------------------------------------------------------------------------------------
         
         except httpx.TimeoutException:
-            logger.error("Timeout en OpenRouter")
+            logger.error("Timeout en NVIDIA NMI")
             raise ValueError("AI_TIMEOUT")
         except httpx.HTTPStatusError as e:
             # Mapeo de errores HTTP a errores de negocio internos
             status_code = e.response.status_code
-            logger.error(f"Error {status_code} de OpenRouter: {e.response.text}")
+            logger.error(f"Error {status_code} de Nvidia: {e.response.text}")
             if status_code == 401:
+                logger.error(f"AI_AUTH_ERROR: {str(e)}")
                 raise ValueError("AI_AUTH_ERROR")
             elif status_code == 422:
+                logger.error(f"AI_VALIDATION_ERROR: {str(e)}")
                 raise ValueError("AI_VALIDATION_ERROR") 
             else:
+                logger.error(f"AI_PROVIDER_ERROR: {str(e)}")
                 raise ValueError("AI_PROVIDER_ERROR")
         except ValueError:
             # RELANZAMIENTO: Permite que errores de negocio (INPUT_INVALIDO) lleguen al Router
@@ -216,156 +229,6 @@ class AIService:
             logger.error(f"Error inesperado: {str(e)}")
             self.eliminar_registro(id_request_ia)
             raise ValueError("AI_UNKNOWN_ERROR")
-    
-    async def save_request(self,id_paciente: int, datos_clinicos: DatosClinicos):
-        """
-        Registra el input priginal en 'ia_request'.
-        Fundamental para trazavilidad y re-entrenamiento del modelo.
-        """
-        response = supabase.table("ia_request").insert({
-            "id_paciente": id_paciente,
-            "datos_clinicos": datos_clinicos.model_dump()
-        }).execute()
-        return response.data[0]
-    
-    def total_request_paciente(self, id_paciente: int) -> RequestsPaciente:
-        """
-        Recuperar el historial de peticiones (inputs) enviadas a la IA para un paciente.
-        """
-        try:
-            # 1. Validación de entrada: Verificamos que el ID no sea nulo o cero.
-            if not id_paciente:
-                return None
-            
-            # 2. Consulta ala tabla de auditoria:
-            # Filtramos por id_paciente y ordenamos cronológicamente (más reciente primero)
-            response =(
-                supabase
-                .table("ia_request")
-                .select("*")
-                .eq("id_paciente", id_paciente)
-                .order("fecha_request",  desc = True)
-                .execute()
-            )
-
-            # 3. Retorno de datos: Devolvemos la lista de registros encontrados.
-            return response.data
-        
-        except Exception as e:
-            # 4. Registro de errores: Si falla la conexión con Supabase o la consulta,
-            # logueamos el detalle técnico y lanzamos un error de negocio.
-            logger.error(f"Error obteniendo requests IA: {str(e)}")
-            raise ValueError("DB_ERROR")
-
-    def total_resumenes_ia(self):
-        """
-        Recupera el listado completo de todos los informes generados por la IA.
-        Se utiliza principalmente para visitas administrativas o auditoria general.
-        """
-        try:
-            # 1. Consulta global a Supabase: Traemos todos los registros de la tabla 'resumen_ia'.
-            # aplicamos un orden descendente por fecha para mostrar siempre la más nueva primero.
-            response = (
-                supabase
-                .table("resumen_ia")
-                .select("*")
-                .order("fecha_generacion", desc= True)
-                .execute()
-            )
-
-            # 2. Retorno de la data: FastAPI se encargará de convertir esta lista en el JSON de respuesta.
-            return response.data
-
-        except Exception as e:
-            # 3. Gestión de errores de infraestructura: Logueamos el error real para el desarrollador
-            # y lanzamos un ValueError genérico para que el Router lo transforme en un HTTP 500
-            logger.error(f"Error obteniendo resumenes IA: {str(e)}")
-            raise ValueError("DB_ERROR")
-
-    def total_resumenes_ia_paciente(self, id_paciente: int) -> ResumenesPaciente:
-        """
-        Consulta el historial de informes/resúmenes generados por la IA
-        específicamente para un paciente.
-        """
-        try:
-            # 1. Validación de seguridad: Evitamos consultas si no hay un ID de paciente.
-            if not id_paciente:
-                return None
-            
-            # 2. Consulta filtrada en Supabase:
-            # Buscamos en la tabla 'resumen_ia' donde el ID coincida.
-            # Ordenamos por 'fecha_generacion' DESC para que el último análisis esté arriba.
-            response = (
-                supabase
-                .table("resumen_ia")
-                .select("*")
-                .eq("id_paciente", id_paciente)
-                .order("fecha_generacion", desc= True)
-                .execute()
-            )
-
-            # 3. Retorno de la información: Devolvemos los datos para ser mostrados en el historial.
-            return response.data
-        
-        except Exception as e:
-            # 4. Control de errores: Registramos el fallo técnico para debugging
-            # y notificamos un error de base de datos a la capa superior.
-            logger.error(f"Error obteniendo resumenes IA: {str(e)}")
-            raise ValueError("DB_ERROR")
-
-    def total_requests(self):
-        """
-        Recupera el historial global de todas las peticiones enviadas a la IA.
-        Sirve para auditoria general y monitoreo del volumen de uso del sistema.
-        """
-        try:
-            # 1. Consulta a Supabase: Seleccionamos todos los campos de la tabla 'ia_request'.
-            # Usamos el orden descendente por 'fecha_request' para que el administrador
-            # vea siempre los últimos eventos en la parte superior.
-            response = (
-                supabase
-                .table("ia_request")
-                .select("*")
-                .order("fecha_request", desc=True)
-                .execute()
-            )
-
-            # 2. Retorno de datos: Devolvemos la lista de diccionarios con el input original.
-            return response.data
-        
-        except Exception as e:
-            # 3. Gestión de errores: Logueamos el error técnico para debugging.
-            # Lanazamos VAlueErrror para que la capa supuerior sepa que hubo un fallo de DB.
-            logger.error(f"Error obteniendo resumenes IA: {str(e)}")
-            raise ValueError("DB_ERROR") 
-
-    def eliminar_registro(self, id_registro : int):
-        """
-        Elimina un registro de auditoria de la 'ia_request'.
-        Se utiliza para limpieza autómatica cuando la generación de la IA falla
-        o cuando el input detectado es inválido.
-        """
-        try:
-            # 1. Log de operación: Registramos el intento de eliminación para trazabilidad
-            logger.info(f"Eliminando registro de auditoria invalido: {id_registro}")
-            
-            # 2. Operación de borrado en Supabase:
-            # Filtramos por la clave primaria 'id_request_ia' para asegurar un borrado preciso.
-            response = (
-                supabase
-                .table("ia_request")
-                .delete()
-                .eq("id_request_ia",id_registro)
-                .execute()
-            )
-
-            # 3. Retrono de confirmación: Devolvemos la respuesta de la DB.
-            return response
-        
-        except Exception as e:
-            # 4. Manejo de errorres: Si falla la conexión, logueamos el error pero no
-            # lanzamos excepción hacia arriba para no interrumpir el flujo principal.
-            logger.error(f"Error al intentar eliminar el registro {id_registro}: {str(e)}")
 
     async def close(self):
         """Close the HTTP client."""
